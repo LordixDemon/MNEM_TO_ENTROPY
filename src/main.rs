@@ -23,17 +23,72 @@ struct Args {
 
     #[arg(long, default_value = "true")]
     hex: bool,
+
+    #[arg(long, default_value = "false")]
+    ignore_checksum: bool,
 }
 
-fn process_mnemonic(mnemonic_str: &str, hex: bool) -> Result<String, String> {
-    let mnemonic = match Mnemonic::from_str(mnemonic_str) {
-        Ok(m) => m,
-        Err(e) => {
-            return Err(format!("Ошибка при парсинге мнемонической фразы: {}", e));
+fn decode_mnemonic_ignore_checksum(mnemonic_str: &str) -> Result<Vec<u8>, String> {
+    let words: Vec<&str> = mnemonic_str.split_whitespace().collect();
+    
+    // Получаем словарь BIP39
+    let wordlist = Language::English.word_list();
+    
+    // Преобразуем слова в индексы
+    let mut indices = Vec::new();
+    for word in &words {
+        match wordlist.iter().position(|&w| w == *word) {
+            Some(idx) => indices.push(idx as u16),
+            None => return Err(format!("Слово '{}' не найдено в словаре BIP39", word)),
         }
+    }
+    
+    // Преобразуем индексы в биты
+    let total_bits = indices.len() * 11;
+    let mut bits = vec![false; total_bits];
+    
+    for (i, &index) in indices.iter().enumerate() {
+        for j in 0..11 {
+            let bit_pos = i * 11 + j;
+            bits[bit_pos] = (index & (1 << (10 - j))) != 0;
+        }
+    }
+    
+    // Проверяем корректное количество слов
+    match words.len() {
+        12 | 15 | 18 | 21 | 24 => {},
+        _ => return Err(format!("Неподдерживаемое количество слов: {}", words.len())),
     };
+    
+    // Извлекаем энтропию (все биты, включая чексум)
+    // Для режима ignore-checksum мы берем ВСЕ биты
+    let num_bytes = (total_bits + 7) / 8; // Округление вверх
+    let mut entropy = vec![0u8; num_bytes];
+    for (i, chunk) in bits.chunks(8).enumerate() {
+        let mut byte = 0u8;
+        for (j, &bit) in chunk.iter().enumerate() {
+            if bit {
+                byte |= 1 << (7 - j);
+            }
+        }
+        entropy[i] = byte;
+    }
+    
+    Ok(entropy)
+}
 
-    let entropy = mnemonic.to_entropy();
+fn process_mnemonic(mnemonic_str: &str, hex: bool, ignore_checksum: bool) -> Result<String, String> {
+    let entropy = if ignore_checksum {
+        decode_mnemonic_ignore_checksum(mnemonic_str)?
+    } else {
+        let mnemonic = match Mnemonic::from_str(mnemonic_str) {
+            Ok(m) => m,
+            Err(e) => {
+                return Err(format!("Ошибка при парсинге мнемонической фразы: {}", e));
+            }
+        };
+        mnemonic.to_entropy()
+    };
     
     if hex {
         Ok(hex::encode(&entropy))
@@ -77,7 +132,7 @@ fn main() {
             continue;
         }
 
-        match process_mnemonic(mnemonic_str, args.hex) {
+        match process_mnemonic(mnemonic_str, args.hex, args.ignore_checksum) {
             Ok(entropy_str) => {
                 if args.output_file.is_none() {
                     println!("\n=== Результат {} ===", idx + 1);
