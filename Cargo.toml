@@ -1,5 +1,5 @@
 [package]
-name = "mnem_to_seed"
+name = "MNEM_TO_ENTROPY"
 version = "0.1.0"
 edition = "2021"
 
