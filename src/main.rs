@@ -4,6 +4,8 @@ use std::str::FromStr;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use rayon::prelude::*;
+use indicatif::{ProgressBar, ProgressStyle};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -97,16 +99,27 @@ fn process_mnemonic(mnemonic_str: &str, hex: bool, ignore_checksum: bool) -> Res
     }
 }
 
+enum ProcessResult {
+    Success(String),
+    Error(String),
+}
+
 fn main() {
     let args = Args::parse();
 
     let mnemonics: Vec<String> = if let Some(input_path) = &args.input_file {
         match fs::read_to_string(input_path) {
             Ok(content) => {
-                content.lines()
+                let data: Vec<String> = content.lines()
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
-                    .collect()
+                    .collect();
+                
+                if args.output_file.is_some() {
+                    println!("📂 Загружено строк: {}", data.len());
+                }
+                
+                data
             }
             Err(e) => {
                 eprintln!("Ошибка при чтении файла {:?}: {}", input_path, e);
@@ -124,27 +137,66 @@ fn main() {
         vec![input.trim().to_string()]
     };
 
-    let mut results = Vec::new();
+    let total_count = mnemonics.len();
+    
+    // Создаём прогресс-бар только если записываем в файл
+    let progress_bar = if args.output_file.is_some() && total_count > 1 {
+        let pb = ProgressBar::new(total_count as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                .unwrap()
+                .progress_chars("#>-")
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
+    // Параллельная обработка
+    let results: Vec<(usize, ProcessResult)> = mnemonics
+        .par_iter()
+        .enumerate()
+        .map(|(idx, mnemonic_str)| {
+            let result = match process_mnemonic(mnemonic_str, args.hex, args.ignore_checksum) {
+                Ok(entropy_str) => ProcessResult::Success(entropy_str),
+                Err(e) => ProcessResult::Error(e),
+            };
+            
+            if let Some(ref pb) = progress_bar {
+                pb.inc(1);
+            }
+            
+            (idx, result)
+        })
+        .collect();
+
+    if let Some(pb) = progress_bar {
+        pb.finish_and_clear();
+    }
+
+    // Сортируем результаты по индексу для сохранения порядка
+    let mut sorted_results = results;
+    sorted_results.sort_by_key(|(idx, _)| *idx);
+
+    let mut success_results = Vec::new();
     let mut has_errors = false;
 
-    for (idx, mnemonic_str) in mnemonics.iter().enumerate() {
-        if mnemonic_str.is_empty() {
-            continue;
-        }
-
-        match process_mnemonic(mnemonic_str, args.hex, args.ignore_checksum) {
-            Ok(entropy_str) => {
+    // Обрабатываем результаты
+    for (idx, result) in sorted_results {
+        match result {
+            ProcessResult::Success(entropy_str) => {
                 if args.output_file.is_none() {
                     println!("\n=== Результат {} ===", idx + 1);
-                    println!("Мнемоническая фраза: {}", mnemonic_str);
+                    println!("Мнемоническая фраза: {}", mnemonics[idx]);
                     println!("Энтропия: {}", entropy_str);
                 }
-                results.push(entropy_str);
+                success_results.push(entropy_str);
             }
-            Err(e) => {
+            ProcessResult::Error(e) => {
                 if args.output_file.is_none() {
                     eprintln!("\n=== Ошибка {} ===", idx + 1);
-                    eprintln!("Мнемоническая фраза: {}", mnemonic_str);
+                    eprintln!("Мнемоническая фраза: {}", mnemonics[idx]);
                     eprintln!("Ошибка: {}", e);
                 }
                 has_errors = true;
@@ -155,16 +207,16 @@ fn main() {
     if let Some(output_path) = &args.output_file {
         match fs::File::create(output_path) {
             Ok(mut file) => {
-                for result in &results {
+                for result in &success_results {
                     if let Err(e) = writeln!(file, "{}", result) {
                         eprintln!("Ошибка при записи в файл {:?}: {}", output_path, e);
                         std::process::exit(1);
                     }
                 }
                 println!("✓ Результаты сохранены в файл: {:?}", output_path);
-                println!("  Обработано успешно: {} мнемоник", results.len());
+                println!("  Обработано успешно: {} мнемоник", success_results.len());
                 if has_errors {
-                    println!("  Ошибок: {}", mnemonics.len() - results.len());
+                    println!("  Ошибок: {}", total_count - success_results.len());
                 }
             }
             Err(e) => {
