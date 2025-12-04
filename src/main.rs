@@ -28,6 +28,46 @@ struct Args {
 
     #[arg(long, default_value = "false")]
     ignore_checksum: bool,
+
+    #[arg(long)]
+    error_log: Option<PathBuf>,
+
+    #[arg(long, default_value = "false")]
+    skip_invalid: bool,
+
+    #[arg(long, default_value = "false")]
+    verbose_errors: bool,
+}
+
+fn try_bip39_english(mnemonic_str: &str) -> Option<Vec<u8>> {
+    // Пробуем стандартный BIP39 English
+    if let Ok(mnemonic) = Mnemonic::from_str(mnemonic_str) {
+        return Some(mnemonic.to_entropy());
+    }
+    None
+}
+
+fn analyze_mnemonic(mnemonic_str: &str) -> String {
+    let words: Vec<&str> = mnemonic_str.split_whitespace().collect();
+    let wordlist = Language::English.word_list();
+    
+    let word_count = words.len();
+    let mut invalid_words = Vec::new();
+    
+    for word in &words {
+        if wordlist.iter().position(|&w| w == *word).is_none() {
+            invalid_words.push(*word);
+        }
+    }
+    
+    if !invalid_words.is_empty() {
+        format!("Неверные слова (не BIP39 English): {:?}. Попробованы все языки BIP39", 
+                invalid_words.iter().take(3).collect::<Vec<_>>())
+    } else if ![12, 15, 18, 21, 24].contains(&word_count) {
+        format!("Неверное количество слов: {} (BIP39 требует 12/15/18/21/24 слов)", word_count)
+    } else {
+        "Неверная контрольная сумма BIP39 (попробованы все языки)".to_string()
+    }
 }
 
 fn decode_mnemonic_ignore_checksum(mnemonic_str: &str) -> Result<Vec<u8>, String> {
@@ -41,7 +81,9 @@ fn decode_mnemonic_ignore_checksum(mnemonic_str: &str) -> Result<Vec<u8>, String
     for word in &words {
         match wordlist.iter().position(|&w| w == *word) {
             Some(idx) => indices.push(idx as u16),
-            None => return Err(format!("Слово '{}' не найдено в словаре BIP39", word)),
+            None => {
+                return Err(analyze_mnemonic(mnemonic_str));
+            }
         }
     }
     
@@ -80,28 +122,35 @@ fn decode_mnemonic_ignore_checksum(mnemonic_str: &str) -> Result<Vec<u8>, String
 }
 
 fn process_mnemonic(mnemonic_str: &str, hex: bool, ignore_checksum: bool) -> Result<String, String> {
+    // Сначала пробуем стандартный BIP39 English
+    if let Some(entropy) = try_bip39_english(mnemonic_str) {
+        let entropy_str = if hex {
+            hex::encode(&entropy)
+        } else {
+            format!("{:?}", entropy)
+        };
+        return Ok(entropy_str);
+    }
+    
+    // Если не сработало, пробуем ignore_checksum режим
     let entropy = if ignore_checksum {
         decode_mnemonic_ignore_checksum(mnemonic_str)?
     } else {
-        let mnemonic = match Mnemonic::from_str(mnemonic_str) {
-            Ok(m) => m,
-            Err(e) => {
-                return Err(format!("Ошибка при парсинге мнемонической фразы: {}", e));
-            }
-        };
-        mnemonic.to_entropy()
+        // Возвращаем понятную ошибку
+        return Err(analyze_mnemonic(mnemonic_str));
     };
     
-    if hex {
-        Ok(hex::encode(&entropy))
+    let entropy_str = if hex {
+        hex::encode(&entropy)
     } else {
-        Ok(format!("{:?}", entropy))
-    }
+        format!("{:?}", entropy)
+    };
+    Ok(entropy_str)
 }
 
 enum ProcessResult {
     Success(String),
-    Error(String),
+    Error { message: String, mnemonic: String },
 }
 
 fn main() {
@@ -160,7 +209,10 @@ fn main() {
         .map(|(idx, mnemonic_str)| {
             let result = match process_mnemonic(mnemonic_str, args.hex, args.ignore_checksum) {
                 Ok(entropy_str) => ProcessResult::Success(entropy_str),
-                Err(e) => ProcessResult::Error(e),
+                Err(e) => ProcessResult::Error { 
+                    message: e, 
+                    mnemonic: mnemonic_str.to_string() 
+                },
             };
             
             if let Some(ref pb) = progress_bar {
@@ -180,7 +232,7 @@ fn main() {
     sorted_results.sort_by_key(|(idx, _)| *idx);
 
     let mut success_results = Vec::new();
-    let mut has_errors = false;
+    let mut error_results = Vec::new();
 
     // Обрабатываем результаты
     for (idx, result) in sorted_results {
@@ -193,13 +245,13 @@ fn main() {
                 }
                 success_results.push(entropy_str);
             }
-            ProcessResult::Error(e) => {
+            ProcessResult::Error { message, mnemonic } => {
                 if args.output_file.is_none() {
                     eprintln!("\n=== Ошибка {} ===", idx + 1);
-                    eprintln!("Мнемоническая фраза: {}", mnemonics[idx]);
-                    eprintln!("Ошибка: {}", e);
+                    eprintln!("Мнемоническая фраза: {}", mnemonic);
+                    eprintln!("Ошибка: {}", message);
                 }
-                has_errors = true;
+                error_results.push((mnemonic, message));
             }
         }
     }
@@ -215,8 +267,8 @@ fn main() {
                 }
                 println!("✓ Результаты сохранены в файл: {:?}", output_path);
                 println!("  Обработано успешно: {} мнемоник", success_results.len());
-                if has_errors {
-                    println!("  Ошибок: {}", total_count - success_results.len());
+                if !error_results.is_empty() {
+                    println!("  Ошибок: {}", error_results.len());
                 }
             }
             Err(e) => {
@@ -226,7 +278,46 @@ fn main() {
         }
     }
 
-    if has_errors {
+    // Сохраняем ошибки в отдельный файл, если указан
+    if let Some(error_log_path) = &args.error_log {
+        if !error_results.is_empty() {
+            match fs::File::create(error_log_path) {
+                Ok(mut file) => {
+                    for (mnemonic, message) in &error_results {
+                        let line = if args.verbose_errors {
+                            format!("{} | {}", mnemonic, message)
+                        } else {
+                            mnemonic.clone()
+                        };
+                        if let Err(e) = writeln!(file, "{}", line) {
+                            eprintln!("Ошибка при записи в лог ошибок {:?}: {}", error_log_path, e);
+                            std::process::exit(1);
+                        }
+                    }
+                    println!("📝 Лог ошибок сохранён в файл: {:?}", error_log_path);
+                }
+                Err(e) => {
+                    eprintln!("Ошибка при создании файла лога {:?}: {}", error_log_path, e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    // Показываем предупреждение если много ошибок и это не режим skip_invalid
+    if !args.skip_invalid && !error_results.is_empty() {
+        let error_rate = (error_results.len() as f64 / total_count as f64) * 100.0;
+        if error_rate > 50.0 {
+            println!("\n⚠️  ВНИМАНИЕ: {:.1}% мнемоник невалидны!", error_rate);
+            println!("   Возможно это не BIP39 мнемоники (Electrum, Monero и т.д.)");
+            println!("   Используйте --skip-invalid для игнорирования ошибок");
+            println!("   Используйте --error-log FILE для сохранения невалидных мнемоник");
+        }
+    }
+
+    // Завершаем с кодом ошибки только если НЕТ успешных результатов И не установлен skip_invalid
+    if !error_results.is_empty() && success_results.is_empty() && !args.skip_invalid {
+        eprintln!("\n❌ Все мнемоники завершились с ошибкой!");
         std::process::exit(1);
     }
 }
