@@ -1,0 +1,27 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Чувствительные данные (мнемоники и энтропия)
+mnemonics.txt
+mnemonic.txt
+entropy.txt
+seeds.txt
+*_mnemonics.txt
+*_entropy.txt
+*.mnemonic
+*.entropy
+
