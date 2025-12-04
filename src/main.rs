@@ -142,9 +142,11 @@ fn main() {
                 results.push(entropy_str);
             }
             Err(e) => {
-                eprintln!("\n=== Ошибка {} ===", idx + 1);
-                eprintln!("Мнемоническая фраза: {}", mnemonic_str);
-                eprintln!("Ошибка: {}", e);
+                if args.output_file.is_none() {
+                    eprintln!("\n=== Ошибка {} ===", idx + 1);
+                    eprintln!("Мнемоническая фраза: {}", mnemonic_str);
+                    eprintln!("Ошибка: {}", e);
+                }
                 has_errors = true;
             }
         }
@@ -159,8 +161,11 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
-                println!("\n✓ Результаты сохранены в файл: {:?}", output_path);
-                println!("  Обработано: {} мнемоник", results.len());
+                println!("✓ Результаты сохранены в файл: {:?}", output_path);
+                println!("  Обработано успешно: {} мнемоник", results.len());
+                if has_errors {
+                    println!("  Ошибок: {}", mnemonics.len() - results.len());
+                }
             }
             Err(e) => {
                 eprintln!("Ошибка при создании файла {:?}: {}", output_path, e);
